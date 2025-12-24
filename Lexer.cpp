@@ -13,6 +13,9 @@ void Lexer::init_keywords() {
 }
 
 vector<string> Lexer::tokenize() {
-    
+    char c;
+    while (source.get(c)) {
+        
+    }
 
 }
