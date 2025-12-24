@@ -10,6 +10,8 @@ int add(int a, int b) {
         return b;
     }
 
+    int c;
+
     cout << "TEST" << endl;
 
     if (b > a) {
@@ -17,4 +19,8 @@ int add(int a, int b) {
     }
 
     return a + b;
+}
+
+int main() {
+    cout << add(1, 2) << endl;
 }
