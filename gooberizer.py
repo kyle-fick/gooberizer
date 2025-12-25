@@ -83,64 +83,78 @@ class Gooberizer:
                 self._build_replacements(child, indent + 1)
             return
 
+
         # only process the node if it's a user file
         if self._check_user_code(cursor) and not self._is_entry_point(cursor):
             print(f"{'  ' * indent}{cursor.kind.name}: '{cursor.spelling}' @ {str(cursor.location)}")
 
             # if declaring for the first time, add it to map
             if self._is_declaration(cursor.kind.name):
-                print(f"DEF: {cursor.spelling} | USR: {cursor.get_usr()}")
-                goober_string = "goober_" + str(self.goober_n)
-                self.goober_map[cursor.get_usr()] = goober_string
-                start_pos = cursor.location.offset
-                self.replacement_list.append({
-                    'start': start_pos,
-                    'end': start_pos + len(cursor.spelling),
-                    'goober': goober_string,
-                    'line': cursor.location.line,
-                    'col': cursor.location.column,
-                    'original': cursor.spelling,
-                    'usr': cursor.get_usr()
-                })
-                self.goober_n += 1
+                # print(f"DEF: {cursor.spelling} | USR: {cursor.get_usr()}")
+                if cursor.get_usr() not in self.goober_map:
+                    # only add to map if we haven't seen it before
+                    self.goober_map[cursor.get_usr()] = "goober_" + str(self.goober_n)
+                    self.goober_n += 1
+
+                # always add replacement
+                self._add_replacement(cursor, cursor.spelling, cursor.get_usr())
 
             # if using existing declaration, check for it in map
             # add it to replacements list if it exists
-            if self._is_reference(cursor.kind.name):
-                print(f"USE: {cursor.referenced.spelling} | Refers to USR: {cursor.referenced.get_usr()}")
-                if cursor.referenced.get_usr() in self.goober_map:
-                    goober_string = self.goober_map[cursor.referenced.get_usr()]
-                    start_pos = cursor.location.offset
-                    self.replacement_list.append({
-                        'start': start_pos,
-                        'end': start_pos + len(cursor.referenced.spelling),
-                        'goober': goober_string,
-                        'line': cursor.location.line,
-                        'col': cursor.location.column,
-                        'original': cursor.referenced.spelling,
-                        'usr': cursor.referenced.get_usr()
-                    })
+            elif self._is_reference(cursor.kind.name):
+                if cursor.referenced.spelling.startswith("operator"):
+                    for child in cursor.get_children():
+                        self._build_replacements(child, indent + 1)
+                    return
 
+                # print(f"USE: {cursor.referenced.spelling} | Refers to USR: {cursor.referenced.get_usr()}")
+                if cursor.referenced.get_usr() in self.goober_map:
+                    self._add_replacement(cursor, cursor.referenced.spelling, cursor.referenced.get_usr())
+
+                elif self._check_user_code(cursor.referenced):
+                    # add original to map if we haven't seen it yet and it's a declaration
+                    self.goober_map[cursor.referenced.get_usr()] = "goober_" + str(self.goober_n)
+                    self.goober_n += 1
+
+                    self._add_replacement(cursor, cursor.referenced.spelling, cursor.referenced.get_usr())
+
+            # if it's a constructor, we check for parent class
+            elif cursor.kind.name == "CONSTRUCTOR":
+                parent = cursor.semantic_parent
+
+                if parent.get_usr() in self.goober_map:
+                    self.goober_map[cursor.get_usr()] = self.goober_map[parent.get_usr()]
+                    self._add_replacement(cursor, parent.spelling, cursor.get_usr())
+
+            elif cursor.kind.name == "DESTRUCTOR":
+                parent = cursor.semantic_parent
+
+                if parent.get_usr() in self.goober_map:
+                    self.goober_map[cursor.get_usr()] = self.goober_map[parent.get_usr()]
+                    self._add_replacement(cursor, parent.spelling, cursor.get_usr(), 1)
+
+        # recursive call
         for child in cursor.get_children():
             self._build_replacements(child, indent + 1)
 
     def _make_replacements(self):
         # sort replacements by end pos, descending
-        self.replacement_list.sort(key=lambda x: x['start'])
+        self.replacement_list.sort(key=lambda x: (x['start'], x['end']))
 
         unique_replacements = []
-        last_start = -1
+        last_end = -1
 
-        # create unique list of replacements, skipping duplicate start pos
+        # create unique list of replacements, skipping overlapping ones
         for r in self.replacement_list:
-            if r['start'] == last_start:
+            # skip if start is before the end of previous
+            if r['start'] < last_end:
                 continue
 
             unique_replacements.append(r)
-            last_start = r['start']
+            last_end = r['end']
 
         self.replacement_list = unique_replacements
-        self.replacement_list.sort(key=lambda x: x['end'], reverse=True)
+        self.replacement_list.sort(key=lambda x: x['start'], reverse=True)
 
         # replace every instance in replacement_list
         for r in self.replacement_list:
@@ -163,6 +177,38 @@ class Gooberizer:
             except Exception as e:
                 print(f"Error: {e}")
 
+    def _add_replacement(self, cursor, original_name, usr, offset=0):
+        # start_pos = cursor.location.offset + offset
+        start_pos = self._get_accurate_offset(cursor, original_name)
+        end_pos = start_pos + len(original_name)
+
+        # make sure what's being replaced is actually correct
+        actual_text = self.source_code[start_pos:end_pos]
+        if actual_text != original_name:
+            return
+
+        self.replacement_list.append({
+            'start': start_pos,
+            'end': end_pos,
+            'goober': self.goober_map[usr],
+            'line': cursor.location.line,
+            'col': cursor.location.column,
+            'original': original_name,
+            'usr': usr
+        })
+
+    # used for handling issues with macro offsets
+    def _get_accurate_offset(self, cursor, expected_name):
+        try:
+            tokens = list(cursor.get_tokens())
+        except:
+            return cursor.location.offset
+
+        for token in tokens:
+            if token.spelling == expected_name:
+                return token.location.offset
+
+        return cursor.location.offset
 
     def _is_declaration(self, kind):
         return kind in [
@@ -181,8 +227,11 @@ class Gooberizer:
         return kind in [
             "DECL_REF_EXPR",
             "MEMBER_REF_EXPR",
+            "MEMBER_REF",
             "TYPE_REF",
-            "OVERLOADED_DECL_REF"
+            "CALL_EXPR",
+            "OVERLOADED_DECL_REF",
+            "CXX_CTOR_INITIALIZER"
         ]
 
     def _check_user_code(self, cursor):
