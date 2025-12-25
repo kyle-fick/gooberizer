@@ -1,4 +1,6 @@
 import os, sys
+import re
+import shutil
 import subprocess
 import clang.cindex
 
@@ -38,100 +40,119 @@ def get_system_include_paths():
 
 class Gooberizer:
     def __init__(self, file_paths, include_paths):
-        self.file_paths = file_paths
-        self.replacement_list = []
+        self.files = [os.path.abspath(f) for f in file_paths]
+        self.include_paths = include_paths
+
         self.goober_map = {}
         self.goober_n = 0
-        self.source_code = ""
 
-        # get source code as a string
-        try:
-            with open(files[0], 'r') as file:
-                self.source_code = file.read()
-        except Exception as e:
-            print(f"Error: {e}")
+        # create gooberized output directory
+        self.output_dir = "gooberized"
+        if os.path.exists(self.output_dir):
+            shutil.rmtree(self.output_dir)
+        os.makedirs(self.output_dir)
 
-        # set up clang pipeline
-        index = clang.cindex.Index.create()
-        args = ['-std=c++17'] + include_paths
-        self.tu = index.parse(files[0], args=args)
-
-        # print include info
-        for diag in self.tu.diagnostics:
-            print(f"DIAGNOSTIC: {diag.spelling}")
 
     def run(self):
-        self._build_replacements(self.tu.cursor)
-        self._make_replacements()
+        print("First pass:")
+        for file_path in self.files:
+            print(f"Processing {os.path.basename(file_path)}")
+            self._process_file(file_path, first_pass=True)
 
-        self.replacement_list.sort(key=lambda x: x['original'])
-        # print replacement_list for debugging
-        # entries: {start, end, goober, line, col, original, usr}
-        print("REPLACEMENTS")
-        print(f"{'line':^6}{'cols':^10}{'original':^30}{'goober':^20}{'usr_string'}")
-        print(f"{'-'*(6+10+30+20)}")
-        for r in self.replacement_list:
-            print(self._r_to_string(r))
+        print("Second pass:")
+        for file_path in self.files:
+            print(f"Processing {os.path.basename(file_path)}")
+            self._process_file(file_path, first_pass=False)
 
-        self._write_files()
-        # print(self.source_code)
+            # print replacement_list for debugging
+            self.current_replacements.sort(key=lambda x: x['original'])
+            print(f"REPLACEMENTS - {file_path}")
+            print(f"{'line':^6}{'cols':^10}{'original':^30}{'goober':^20}{'usr_string'}")
+            print(f"{'-'*(6+10+30+20)}")
+            for r in self.current_replacements:
+                print(self._r_to_string(r))
+
+
+        # # print replacement_list for debugging
+        # # print(self.source_code)
+
+    def _process_file(self, file_path, first_pass):
+        with open(file_path, 'r') as f:
+            source_code = f.read()
+
+        index = clang.cindex.Index.create()
+        args = ['-std=c++17'] + self.include_paths
+        tu = index.parse(file_path, args=args)
+
+        self.current_replacements = []
+        self.current_source = source_code
+        self.current_file = file_path
+
+        # this is wasteful since I'm building the list on the first time when I don't need
+        # to be, but I can fix it later if it's too slow
+        self._build_replacements(tu.cursor)
+
+        if not first_pass:
+            self._make_replacements()
+            self._write_file(self.current_file)
+
 
     def _build_replacements(self, cursor, indent=0):
-        # skip this node if it's not in a file
-        if cursor.location.file is None:
+        if cursor.spelling == "read_header":
+            pass
+
+        if not self._can_be_renamed(cursor):
             for child in cursor.get_children():
                 self._build_replacements(child, indent + 1)
             return
 
+        print(f"{'  ' * indent}{cursor.kind.name}: '{cursor.spelling}' @ {str(cursor.location)}")
 
-        # only process the node if it's a user file
-        if self._check_user_code(cursor) and not self._is_entry_point(cursor):
-            print(f"{'  ' * indent}{cursor.kind.name}: '{cursor.spelling}' @ {str(cursor.location)}")
+        # if declaring for the first time, add it to map
+        if self._is_declaration(cursor.kind.name):
+            # print(f"DEF: {cursor.spelling} | USR: {cursor.get_usr()}")
+            if cursor.get_usr() not in self.goober_map:
+                # only add to map if we haven't seen it before
+                self.goober_map[cursor.get_usr()] = "goober_" + str(self.goober_n)
+                self.goober_n += 1
 
-            # if declaring for the first time, add it to map
-            if self._is_declaration(cursor.kind.name):
-                # print(f"DEF: {cursor.spelling} | USR: {cursor.get_usr()}")
-                if cursor.get_usr() not in self.goober_map:
-                    # only add to map if we haven't seen it before
-                    self.goober_map[cursor.get_usr()] = "goober_" + str(self.goober_n)
-                    self.goober_n += 1
+            # always add replacement
+            self._add_replacement(cursor, cursor.spelling, cursor.get_usr())
 
-                # always add replacement
-                self._add_replacement(cursor, cursor.spelling, cursor.get_usr())
+        # if using existing declaration, check for it in map
+        # add it to replacements list if it exists
+        elif self._is_reference(cursor.kind.name):
+            # check if reference can be renamed first
+            if not self._can_be_renamed(cursor.referenced):
+                for child in cursor.get_children():
+                    self._build_replacements(child, indent + 1)
+                return
 
-            # if using existing declaration, check for it in map
-            # add it to replacements list if it exists
-            elif self._is_reference(cursor.kind.name):
-                if cursor.referenced.spelling.startswith("operator"):
-                    for child in cursor.get_children():
-                        self._build_replacements(child, indent + 1)
-                    return
+            # print(f"USE: {cursor.referenced.spelling} | Refers to USR: {cursor.referenced.get_usr()}")
+            if cursor.referenced.get_usr() in self.goober_map:
+                self._add_replacement(cursor, cursor.referenced.spelling, cursor.referenced.get_usr())
 
-                # print(f"USE: {cursor.referenced.spelling} | Refers to USR: {cursor.referenced.get_usr()}")
-                if cursor.referenced.get_usr() in self.goober_map:
-                    self._add_replacement(cursor, cursor.referenced.spelling, cursor.referenced.get_usr())
+            elif self._check_user_code(cursor.referenced):
+                # add original to map if we haven't seen it yet and it's a declaration
+                self.goober_map[cursor.referenced.get_usr()] = "goober_" + str(self.goober_n)
+                self.goober_n += 1
 
-                elif self._check_user_code(cursor.referenced):
-                    # add original to map if we haven't seen it yet and it's a declaration
-                    self.goober_map[cursor.referenced.get_usr()] = "goober_" + str(self.goober_n)
-                    self.goober_n += 1
+                self._add_replacement(cursor, cursor.referenced.spelling, cursor.referenced.get_usr())
 
-                    self._add_replacement(cursor, cursor.referenced.spelling, cursor.referenced.get_usr())
+        # if it's a constructor, we check for parent class
+        elif cursor.kind.name == "CONSTRUCTOR":
+            parent = cursor.semantic_parent
 
-            # if it's a constructor, we check for parent class
-            elif cursor.kind.name == "CONSTRUCTOR":
-                parent = cursor.semantic_parent
+            if parent.get_usr() in self.goober_map:
+                self.goober_map[cursor.get_usr()] = self.goober_map[parent.get_usr()]
+                self._add_replacement(cursor, parent.spelling, cursor.get_usr())
 
-                if parent.get_usr() in self.goober_map:
-                    self.goober_map[cursor.get_usr()] = self.goober_map[parent.get_usr()]
-                    self._add_replacement(cursor, parent.spelling, cursor.get_usr())
+        elif cursor.kind.name == "DESTRUCTOR":
+            parent = cursor.semantic_parent
 
-            elif cursor.kind.name == "DESTRUCTOR":
-                parent = cursor.semantic_parent
-
-                if parent.get_usr() in self.goober_map:
-                    self.goober_map[cursor.get_usr()] = self.goober_map[parent.get_usr()]
-                    self._add_replacement(cursor, parent.spelling, cursor.get_usr(), 1)
+            if parent.get_usr() in self.goober_map:
+                self.goober_map[cursor.get_usr()] = self.goober_map[parent.get_usr()]
+                self._add_replacement(cursor, parent.spelling, cursor.get_usr(), 1)
 
         # recursive call
         for child in cursor.get_children():
@@ -139,13 +160,13 @@ class Gooberizer:
 
     def _make_replacements(self):
         # sort replacements by end pos, descending
-        self.replacement_list.sort(key=lambda x: (x['start'], x['end']))
+        self.current_replacements.sort(key=lambda x: (x['start'], x['end']))
 
         unique_replacements = []
         last_end = -1
 
         # create unique list of replacements, skipping overlapping ones
-        for r in self.replacement_list:
+        for r in self.current_replacements:
             # skip if start is before the end of previous
             if r['start'] < last_end:
                 continue
@@ -153,29 +174,28 @@ class Gooberizer:
             unique_replacements.append(r)
             last_end = r['end']
 
-        self.replacement_list = unique_replacements
-        self.replacement_list.sort(key=lambda x: x['start'], reverse=True)
+        self.current_replacements = unique_replacements
+        self.current_replacements.sort(key=lambda x: x['start'], reverse=True)
 
         # replace every instance in replacement_list
-        for r in self.replacement_list:
+        for r in self.current_replacements:
             start = r['start']
             end = r['end']
             name = r['goober']
 
-            self.source_code = self.source_code[:start] + name + self.source_code[end:]
+            self.current_source = self.current_source[:start] + name + self.current_source[end:]
 
-    def _write_files(self):
-        for file in self.file_paths:
-            base, ext = os.path.splitext(file)
+    # write file original_path with new contents current_source to new output output_dir/filename
+    def _write_file(self, original_path):
+        filename = os.path.basename(original_path)
+        out_path = os.path.join(self.output_dir, filename)
 
-            out_path = f"{base}_goober{ext}"
-
-            try:
-                with open(out_path, 'w') as f:
-                    f.write(self.source_code)
-                print(f"Successfully gooberized {file} as {out_path}")
-            except Exception as e:
-                print(f"Error: {e}")
+        try:
+            with open(out_path, 'w') as f:
+                f.write(self.current_source)
+            print(f"Successfully gooberized {filename} as {out_path}")
+        except Exception as e:
+            print(f"Error: {e}")
 
     def _add_replacement(self, cursor, original_name, usr, offset=0):
         # start_pos = cursor.location.offset + offset
@@ -183,11 +203,11 @@ class Gooberizer:
         end_pos = start_pos + len(original_name)
 
         # make sure what's being replaced is actually correct
-        actual_text = self.source_code[start_pos:end_pos]
+        actual_text = self.current_source[start_pos:end_pos]
         if actual_text != original_name:
             return
 
-        self.replacement_list.append({
+        self.current_replacements.append({
             'start': start_pos,
             'end': end_pos,
             'goober': self.goober_map[usr],
@@ -196,6 +216,32 @@ class Gooberizer:
             'original': original_name,
             'usr': usr
         })
+
+    # all checks for whether a cursor can be renamed
+    def _can_be_renamed(self, def_cursor):
+        if not def_cursor:
+            return False
+
+        if def_cursor.location.file is None:
+            return False
+
+        if not self._check_user_code(def_cursor):
+            return False
+
+        if self._is_entry_point(def_cursor):
+            return False
+
+        if self._is_cpp_operator(def_cursor.spelling):
+            return False
+
+        if def_cursor.spelling == "":
+            return False
+
+        if def_cursor.kind.name == "CXX_METHOD":
+            if def_cursor.is_virtual_method():
+                return False
+
+        return True
 
     # used for handling issues with macro offsets
     def _get_accurate_offset(self, cursor, expected_name):
@@ -217,6 +263,8 @@ class Gooberizer:
             "FUNCTION_DECL",
             "CLASS_DECL",
             "STRUCT_DECL",
+            "ENUM_DECL",
+            "ENUM_CONSTANT_DECL",
             "CXX_METHOD",
             "FIELD_DECL",
             "TYPEDEF_DECL",
@@ -239,8 +287,7 @@ class Gooberizer:
             return False
 
         cursor_abs = os.path.abspath(cursor.location.file.name)
-        file_abs = os.path.abspath(self.file_paths[0])
-        return cursor_abs == file_abs
+        return cursor_abs in self.files
 
     # checks that we're not looking at the main function
     def _is_entry_point(self, cursor):
@@ -252,6 +299,27 @@ class Gooberizer:
             return True
 
         return False
+
+    def _is_cpp_operator(self, name):
+        return bool(re.match(r'^operator\W', name))
+
+    # checks if method overrides method from system header
+    # def _is_system_override(self, cursor):
+    #     if cursor.kind.name != "CXX_METHOD":
+    #         return False
+    #
+    #     overrides = cursor.get_overridden_cursors()
+    #
+    #     for base_method in overrides:
+    #         # check if any base method is a system method
+    #         if not self._check_user_code(base_method):
+    #             return True
+    #
+    #         # otherwise recursively check if it's an override of a system method
+    #         if self._is_system_override(base_method):
+    #             return True
+    #
+    #     return False
 
     def _r_to_string(self, r):
         return f"{r['line']:<6}{str(r['col'])+'-'+str(r['col'] + r['end'] - r['start']):<10}{r['original']:<30}{r['goober']:<20}{r['usr']}"
