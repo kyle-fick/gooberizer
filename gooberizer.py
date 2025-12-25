@@ -81,8 +81,17 @@ class Gooberizer:
             source_code = f.read()
 
         index = clang.cindex.Index.create()
-        args = ['-std=c++17'] + self.include_paths
-        tu = index.parse(file_path, args=args)
+        args = ['-x', 'c++', '-std=c++17'] + self.include_paths
+        options = clang.cindex.TranslationUnit.PARSE_INCOMPLETE
+
+        try:
+            tu = index.parse(file_path, args=args, options=options)
+        except clang.cindex.TranslationUnitLoadError:
+            print(f"FATAL: Clang failed to parse {file_path}")
+            return
+
+        for diag in tu.diagnostics:
+            print(f"Message: {diag.spelling}")
 
         self.current_replacements = []
         self.current_source = source_code
@@ -98,8 +107,13 @@ class Gooberizer:
 
 
     def _build_replacements(self, cursor, indent=0):
-        if cursor.spelling == "read_header":
-            pass
+        # major speedup! But does it break things?
+        if cursor.location.file:
+            cursor_file = os.path.abspath(cursor.location.file.name)
+            current_file = os.path.abspath(self.current_file)
+
+            if cursor_file != current_file:
+                return
 
         if not self._can_be_renamed(cursor):
             for child in cursor.get_children():
