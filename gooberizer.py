@@ -1,6 +1,5 @@
 import os, sys
 import re
-import shutil
 import argparse
 import glob
 import subprocess
@@ -53,10 +52,11 @@ class Gooberizer:
         self.goober_map = {}
         self.goober_n = 0
 
-        # create gooberized output directory and remove old files
-        if os.path.exists(self.output_dir):
-            shutil.rmtree(self.output_dir)
-        os.makedirs(self.output_dir)
+        # # create gooberized output directory and remove old files
+        # if os.path.exists(self.output_dir):
+        #     shutil.rmtree(self.output_dir)
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
 
 
     def log(self, message):
@@ -67,17 +67,17 @@ class Gooberizer:
         # first pass for building goober map
         print("First pass:")
         for file_path in self.files:
-            print(f"Processing {os.path.basename(file_path)}")
+            print(f"Processing {os.path.basename(file_path)}...", end="")
             self._process_file(file_path, first_pass=True)
+            print("Done")
 
         # second pass for building replacement list and making replacements
         print("Second pass:")
         for file_path in self.files:
-            print(f"Processing {os.path.basename(file_path)}")
+            print(f"Processing {os.path.basename(file_path)}...", end="")
             self._process_file(file_path, first_pass=False)
 
             self._print_replacement_table(file_path)
-
 
     def _print_replacement_table(self, file_path):
         self.current_replacements.sort(key=lambda x: x['original'])
@@ -112,14 +112,14 @@ class Gooberizer:
 
         # this is wasteful since I'm building the list on the first time when I don't need
         # to be, but I can fix it later if it's too slow
-        self._build_replacements(tu.cursor)
+        self._build_replacements(tu.cursor, first_pass=first_pass)
 
         if not first_pass:
             self._make_replacements()
             self._write_file(self.current_file)
 
 
-    def _build_replacements(self, cursor, indent=0):
+    def _build_replacements(self, cursor, indent=0, first_pass=False):
         # only check it if it's in the file we're currently looking at
         # majorly speeds up gooberizing, and fixes issues with macros
         if cursor.location.file:
@@ -132,11 +132,12 @@ class Gooberizer:
         # skip this node if it can't be renamed, but not its children
         if not self._can_be_renamed(cursor):
             for child in cursor.get_children():
-                self._build_replacements(child, indent + 1)
+                self._build_replacements(child, indent + 1, first_pass)
             return
 
         # print node info
-        self.log(f"{'  ' * indent}{cursor.kind.name}: '{cursor.spelling}' @ {str(cursor.location)}")
+        if first_pass:
+            self.log(f"{'  ' * indent}{cursor.kind.name}: '{cursor.spelling}' @ {str(cursor.location)}")
 
         # if declaring for the first time, add it to map
         if self._is_declaration(cursor.kind.name):
@@ -146,7 +147,8 @@ class Gooberizer:
                 self.goober_n += 1
 
             # always add replacement
-            self._add_replacement(cursor, cursor.spelling, cursor.get_usr())
+            if not first_pass:
+                self._add_replacement(cursor, cursor.spelling, cursor.get_usr())
 
         # if using existing declaration, check for it in map
         # add it to replacements list if it exists
@@ -154,39 +156,40 @@ class Gooberizer:
             # check if reference can be renamed first
             if not self._can_be_renamed(cursor.referenced):
                 for child in cursor.get_children():
-                    self._build_replacements(child, indent + 1)
+                    self._build_replacements(child, indent + 1, first_pass)
                 return
 
             if cursor.referenced.get_usr() in self.goober_map:
-                self._add_replacement(cursor, cursor.referenced.spelling, cursor.referenced.get_usr())
+                if not first_pass:
+                    self._add_replacement(cursor, cursor.referenced.spelling, cursor.referenced.get_usr())
 
             elif self._check_user_code(cursor.referenced):
                 # add original to map if we haven't seen it yet and it's a user declaration
                 self.goober_map[cursor.referenced.get_usr()] = "goober_" + str(self.goober_n)
                 self.goober_n += 1
 
-                self._add_replacement(cursor, cursor.referenced.spelling, cursor.referenced.get_usr())
+                if not first_pass:
+                    self._add_replacement(cursor, cursor.referenced.spelling, cursor.referenced.get_usr())
 
-        # if it's a constructor, we check for parent class, since it'll always have been
-        # delcared before the constructor
-        elif cursor.kind.name == "CONSTRUCTOR":
+        # if it's a constructor/destructor, we check for parent class. If it doesn't exist,
+        # we add it to the map like normal
+        elif cursor.kind.name == "CONSTRUCTOR" or cursor.kind.name == "DESTRUCTOR":
             parent = cursor.semantic_parent
 
             if parent.get_usr() in self.goober_map:
                 self.goober_map[cursor.get_usr()] = self.goober_map[parent.get_usr()]
-                self._add_replacement(cursor, parent.spelling, cursor.get_usr())
 
-        # same idea with destructor
-        elif cursor.kind.name == "DESTRUCTOR":
-            parent = cursor.semantic_parent
+            else:
+                self.goober_map[parent.get_usr()] = "goober_" + str(self.goober_n)
+                self.goober_map[cursor.get_usr()] = "goober_" + str(self.goober_n)
+                self.goober_n += 1
 
-            if parent.get_usr() in self.goober_map:
-                self.goober_map[cursor.get_usr()] = self.goober_map[parent.get_usr()]
+            if not first_pass:
                 self._add_replacement(cursor, parent.spelling, cursor.get_usr())
 
         # recursive call
         for child in cursor.get_children():
-            self._build_replacements(child, indent + 1)
+            self._build_replacements(child, indent + 1, first_pass)
 
     def _make_replacements(self):
         # sort replacements by start then end pos
@@ -282,6 +285,13 @@ class Gooberizer:
         except:
             return cursor.location.offset
 
+        # first check is for matching token in same position. Handles issues with
+        # things like Class::Class() for constructor implementations
+        for token in tokens:
+            if token.location.offset == cursor.location.offset and token.spelling == expected_name:
+                return cursor.location.offset
+
+        # second check for matching name tokens
         for token in tokens:
             if token.spelling == expected_name:
                 return token.location.offset
@@ -365,8 +375,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # get preprocessor args
-    print("Getting system include paths")
+    print("Getting system include paths...", end="")
     include_paths = get_system_include_paths()
+    print("Done")
 
     gb = Gooberizer(expanded_files, include_paths, args.output, args.verbose)
     gb.run()
