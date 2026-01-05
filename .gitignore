@@ -1,5 +1,5 @@
 cmake-build-debug
+CMakeLists.txt
 .idea
-gooberized
 .venv
 /testing/
