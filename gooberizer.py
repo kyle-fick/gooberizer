@@ -271,6 +271,9 @@ class Gooberizer:
         if def_cursor.spelling == "":
             return False
 
+        if def_cursor.spelling.startswith('['):
+            return False
+
         # skip virtual methods since they can cause issues
         if def_cursor.kind.name == "CXX_METHOD":
             if def_cursor.is_virtual_method():
@@ -310,7 +313,8 @@ class Gooberizer:
             "CXX_METHOD",
             "FIELD_DECL",
             "TYPEDEF_DECL",
-            "TYPE_ALIAS_DECL"
+            "TYPE_ALIAS_DECL",
+            "UNEXPOSED_DECL"
         ]
 
     def _is_reference(self, kind):
